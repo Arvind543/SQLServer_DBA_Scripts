@@ -1,5 +1,9 @@
------  Below is a stored procedure for SQL Server that identifies and kills sessions (SPIDs) that have been idle for more than one day.
------ Procedure to Kill Idle Sessions Older Than One Day
+-----  Created By: Arvind Toorpu
+-----  Create Date: 12/04/2024
+-----  Details: Below is a stored procedure for SQL Server that identifies and kills sessions (SPIDs) that have been idle for more than one day.
+-----  Procedure to Kill Idle Sessions Older Than One Day 
+
+  
 CREATE PROCEDURE kill_idle_sessions
 AS
   BEGIN
