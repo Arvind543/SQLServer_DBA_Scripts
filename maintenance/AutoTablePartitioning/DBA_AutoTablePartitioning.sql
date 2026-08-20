@@ -373,6 +373,271 @@ BEGIN
 END;
 GO
 
+CREATE OR ALTER PROCEDURE dbo.usp_DBA_BatchLoadPartitionedTable
+    @SourceSchemaName sysname,
+    @SourceTableName sysname,
+    @TargetSchemaName sysname,
+    @TargetTableName sysname,
+    @BatchColumn sysname,
+    @BatchSize int = 100000,
+    @StartValue nvarchar(128) = NULL,
+    @EndValue nvarchar(128) = NULL,
+    @ResumeFromValue bit = 0,
+    @KeepIdentity bit = 1,
+    @MaxBatches int = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @sourceObjectId int=OBJECT_ID(QUOTENAME(@SourceSchemaName)+N'.'+QUOTENAME(@SourceTableName),N'U'),
+        @targetObjectId int=OBJECT_ID(QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName),N'U'),
+        @batchColumnId int, @systemTypeId int, @identityColumn sysname, @sql nvarchar(max),
+        @columnList nvarchar(max), @lastValue nvarchar(128)=NULL, @nextValue nvarchar(128),
+        @insertedRows bigint, @totalRows bigint=0, @batchNumber int=0, @runId uniqueidentifier=NEWID(), @hasIdentity bit=0;
+
+    IF @sourceObjectId IS NULL THROW 51030,'The source table does not exist.',1;
+    IF @targetObjectId IS NULL THROW 51031,'The target table does not exist.',1;
+    IF @sourceObjectId=@targetObjectId THROW 51032,'Source and target tables must be different.',1;
+    IF @BatchSize<1 THROW 51033,'BatchSize must be at least 1.',1;
+    IF @MaxBatches<0 THROW 51034,'MaxBatches cannot be negative.',1;
+    IF @ResumeFromValue=1 AND @StartValue IS NULL THROW 51041,'StartValue is required when ResumeFromValue is 1.',1;
+    IF EXISTS
+    (
+        SELECT 1 FROM sys.dm_db_partition_stats WHERE object_id=@targetObjectId AND index_id IN (0,1) AND row_count>0
+    ) AND @ResumeFromValue=0
+        THROW 51035,'The target table must be empty before a batch load.',1;
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes i JOIN sys.partition_schemes ps ON ps.data_space_id=i.data_space_id
+        WHERE i.object_id=@targetObjectId AND i.index_id=1
+    )
+        THROW 51036,'The target table must have a clustered index on a partition scheme.',1;
+
+    SELECT @batchColumnId=c.column_id,@systemTypeId=c.system_type_id
+    FROM sys.columns c WHERE c.object_id=@sourceObjectId AND c.name=@BatchColumn;
+    IF @batchColumnId IS NULL THROW 51037,'The batch column does not exist on the source table.',1;
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id=@targetObjectId AND name=@BatchColumn AND system_type_id=@systemTypeId)
+        THROW 51038,'The batch column is missing or has an incompatible type on the target table.',1;
+    IF @systemTypeId NOT IN (40,42,58,61,48,52,56,127)
+        THROW 51039,'BatchColumn must be date, datetime, datetime2, smalldatetime, tinyint, smallint, int, or bigint.',1;
+
+    SELECT TOP (1) @identityColumn=c.name FROM sys.columns c WHERE c.object_id=@sourceObjectId AND c.is_identity=1;
+    IF @identityColumn IS NOT NULL AND @KeepIdentity=1 SET @hasIdentity=1;
+    SELECT @columnList=STUFF((SELECT N','+QUOTENAME(sc.name)
+        FROM sys.columns sc JOIN sys.columns tc ON tc.object_id=@targetObjectId AND tc.name=sc.name
+        WHERE sc.object_id=@sourceObjectId AND sc.is_computed=0 AND sc.generated_always_type=0
+          AND (@KeepIdentity=1 OR sc.is_identity=0) AND tc.is_computed=0 AND tc.generated_always_type=0
+        ORDER BY sc.column_id FOR XML PATH(''),TYPE).value('.','nvarchar(max)'),1,1,N'');
+    IF @columnList IS NULL THROW 51040,'No compatible insertable columns were found between source and target.',1;
+
+    WHILE @MaxBatches=0 OR @batchNumber<@MaxBatches
+    BEGIN
+        SET @nextValue=NULL;
+        SET @sql=N'SELECT @NextValue=CONVERT(nvarchar(128),MAX(BatchValue),126) FROM '
+            +N'(SELECT TOP (@BatchSize) '+QUOTENAME(@BatchColumn)+N' AS BatchValue FROM '
+            +QUOTENAME(@SourceSchemaName)+N'.'+QUOTENAME(@SourceTableName)
+            +N' WHERE '+QUOTENAME(@BatchColumn)+N' IS NOT NULL AND '
+            +N'((@LastValue IS NULL AND ((@ResumeFromValue=1 AND '+QUOTENAME(@BatchColumn)+N'>CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@StartValue)) OR (@ResumeFromValue=0 AND (@StartValue IS NULL OR '+QUOTENAME(@BatchColumn)+N'>=CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@StartValue))))) '
+            +N'OR (@LastValue IS NOT NULL AND '+QUOTENAME(@BatchColumn)+N'>CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@LastValue))) '
+            +N'AND (@EndValue IS NULL OR '+QUOTENAME(@BatchColumn)+N'<=CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@EndValue)) '
+            +N'ORDER BY '+QUOTENAME(@BatchColumn)+N') AS B;';
+        EXEC sys.sp_executesql @sql,N'@BatchSize int,@LastValue nvarchar(128),@StartValue nvarchar(128),@EndValue nvarchar(128),@ResumeFromValue bit,@NextValue nvarchar(128) OUTPUT',
+            @BatchSize=@BatchSize,@LastValue=@lastValue,@StartValue=@StartValue,@EndValue=@EndValue,@ResumeFromValue=@ResumeFromValue,@NextValue=@nextValue OUTPUT;
+        IF @nextValue IS NULL BREAK;
+
+        BEGIN TRY
+            BEGIN TRANSACTION;
+            SET @sql=CASE WHEN @hasIdentity=1 THEN N'SET IDENTITY_INSERT '+QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName)+N' ON;' ELSE N'' END
+                +N'INSERT '+QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName)+N'('+@columnList+N') SELECT '+@columnList+N' FROM '
+                +QUOTENAME(@SourceSchemaName)+N'.'+QUOTENAME(@SourceTableName)+N' WHERE '+QUOTENAME(@BatchColumn)+N' IS NOT NULL AND '
+                +N'((@LastValue IS NULL AND ((@ResumeFromValue=1 AND '+QUOTENAME(@BatchColumn)+N'>CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@StartValue)) OR (@ResumeFromValue=0 AND (@StartValue IS NULL OR '+QUOTENAME(@BatchColumn)+N'>=CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@StartValue))))) '
+                +N'OR (@LastValue IS NOT NULL AND '+QUOTENAME(@BatchColumn)+N'>CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@LastValue))) '
+                +N'AND '+QUOTENAME(@BatchColumn)+N'<=CONVERT('+CASE WHEN @systemTypeId IN (48,52,56,127) THEN N'bigint' ELSE N'datetime2(7)' END+',@NextValue); SET @InsertedRows=@@ROWCOUNT;'
+                +CASE WHEN @hasIdentity=1 THEN N'SET IDENTITY_INSERT '+QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName)+N' OFF;' ELSE N'' END;
+            EXEC sys.sp_executesql @sql,N'@LastValue nvarchar(128),@StartValue nvarchar(128),@NextValue nvarchar(128),@ResumeFromValue bit,@InsertedRows bigint OUTPUT',
+                @LastValue=@lastValue,@StartValue=@StartValue,@NextValue=@nextValue,@ResumeFromValue=@ResumeFromValue,@InsertedRows=@insertedRows OUTPUT;
+            COMMIT TRANSACTION;
+            SET @batchNumber+=1;
+            SET @totalRows+=@insertedRows;
+            INSERT dbo.DBA_PartitionMaintenanceHistory(RunId,Action,SchemaName,TableName,BoundaryValue,CommandText,RowsAffected,Succeeded)
+                VALUES(@runId,'INITIAL_LOAD_BATCH',@TargetSchemaName,@TargetTableName,@nextValue,@sql,@insertedRows,1);
+            SET @lastValue=@nextValue;
+        END TRY
+        BEGIN CATCH
+            IF @hasIdentity=1 AND OBJECTPROPERTY(@targetObjectId,'TableHasIdentity')=1
+                BEGIN TRY EXEC(N'SET IDENTITY_INSERT '+QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName)+N' OFF;'); END TRY BEGIN CATCH END CATCH;
+            IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
+            INSERT dbo.DBA_PartitionMaintenanceHistory(RunId,Action,SchemaName,TableName,BoundaryValue,CommandText,Succeeded,ErrorNumber,ErrorMessage)
+                VALUES(@runId,'INITIAL_LOAD_ERROR',@TargetSchemaName,@TargetTableName,@lastValue,@sql,0,ERROR_NUMBER(),ERROR_MESSAGE());
+            THROW;
+        END CATCH;
+    END;
+    INSERT dbo.DBA_PartitionMaintenanceHistory(RunId,Action,SchemaName,TableName,BoundaryValue,RowsAffected,Succeeded)
+        VALUES(@runId,'INITIAL_LOAD_COMPLETE',@TargetSchemaName,@TargetTableName,@lastValue,@totalRows,1);
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_DBA_CreateAndLoadPartitionedTable
+    @SourceSchemaName sysname,
+    @SourceTableName sysname,
+    @TargetSchemaName sysname,
+    @TargetTableName sysname,
+    @PartitionColumn sysname,
+    @RangeUnit varchar(10),
+    @StartValue nvarchar(128),
+    @EndValue nvarchar(128),
+    @PartitionInterval int = 1,
+    @PartitionFunctionName sysname = NULL,
+    @PartitionSchemeName sysname = NULL,
+    @FilegroupName sysname = 'PRIMARY',
+    @DeploymentPlatform varchar(20) = 'AUTO',
+    @IndexAlignment varchar(12) = 'ALIGNED',
+    @BatchColumn sysname = NULL,
+    @BatchSize int = 100000,
+    @LoadStartValue nvarchar(128) = NULL,
+    @LoadEndValue nvarchar(128) = NULL,
+    @KeepIdentity bit = 1,
+    @MaxBatches int = 0,
+    @AutoDeleteOldPartitions bit = 0,
+    @FuturePartitions int = 4,
+    @RetentionPartitions int = 52,
+    @IndexAction varchar(12) = 'AUTO',
+    @StatsAction varchar(12) = 'AUTO',
+    @StatsSamplePercent int = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @sourceObjectId int=OBJECT_ID(QUOTENAME(@SourceSchemaName)+N'.'+QUOTENAME(@SourceTableName),N'U'),
+        @targetObjectId int, @sourceClusteredId int, @sql nvarchar(max), @keyColumns nvarchar(max),
+        @includeColumns nvarchar(max), @filter nvarchar(max), @placement nvarchar(300), @indexName sysname, @indexUnique bit, @indexId int,
+        @constraintName sysname, @constraintType char(1), @partitionType sysname, @targetObjectName nvarchar(517),
+        @targetClusteredName sysname, @runId uniqueidentifier=NEWID(), @newConfigId int;
+    IF @sourceObjectId IS NULL THROW 51050,'The source table does not exist.',1;
+    IF OBJECT_ID(QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName),N'U') IS NOT NULL
+        THROW 51051,'The target table already exists.',1;
+    IF SCHEMA_ID(@TargetSchemaName) IS NULL THROW 51052,'The target schema does not exist.',1;
+    IF @BatchColumn IS NULL SET @BatchColumn=@PartitionColumn;
+    IF @PartitionFunctionName IS NULL SET @PartitionFunctionName=LEFT(N'PF_DBA_'+@TargetTableName+N'_'+@PartitionColumn,128);
+    IF @PartitionSchemeName IS NULL SET @PartitionSchemeName=LEFT(N'PS_DBA_'+@TargetTableName+N'_'+@PartitionColumn,128);
+    SET @targetObjectName=QUOTENAME(@TargetSchemaName)+N'.'+QUOTENAME(@TargetTableName);
+
+    SELECT @sourceClusteredId=index_id FROM sys.indexes WHERE object_id=@sourceObjectId AND index_id=1;
+    IF @sourceClusteredId IS NULL THROW 51053,'The source table must have a clustered index.',1;
+    IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id=@sourceObjectId AND is_computed=1)
+        THROW 51054,'Computed columns require an explicit target DDL because SELECT INTO materializes them.',1;
+    IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=@sourceObjectId AND type NOT IN (0,1,2))
+        THROW 51055,'The source contains an unsupported specialized index. Review metadata before automatic copy.',1;
+
+    BEGIN TRY
+        SET @sql=N'SELECT TOP (0) * INTO '+@targetObjectName+N' FROM '+QUOTENAME(@SourceSchemaName)+N'.'+QUOTENAME(@SourceTableName)+N';';
+        EXEC sys.sp_executesql @sql;
+        SET @targetObjectId=OBJECT_ID(@targetObjectName,N'U');
+
+        SELECT @keyColumns=STUFF((SELECT N','+QUOTENAME(c.name)+(CASE WHEN ic.is_descending_key=1 THEN N' DESC' ELSE N' ASC' END)
+            FROM sys.index_columns ic JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+            WHERE ic.object_id=@sourceObjectId AND ic.index_id=1 AND ic.key_ordinal>0 ORDER BY ic.key_ordinal FOR XML PATH(''),TYPE).value('.','nvarchar(max)'),1,1,N'');
+        SELECT @targetClusteredName=CASE WHEN i.is_primary_key=1 THEN LEFT(N'CX_DBA_Load_'+@TargetTableName,128) ELSE i.name END
+        FROM sys.indexes i WHERE i.object_id=@sourceObjectId AND i.index_id=1;
+        SET @sql=N'CREATE CLUSTERED INDEX '+QUOTENAME(@targetClusteredName)+N' ON '+@targetObjectName+N'('+@keyColumns+N');';
+        EXEC sys.sp_executesql @sql;
+
+        EXEC dbo.usp_DBA_ConvertTableToPartitioned
+            @SchemaName=@TargetSchemaName,@TableName=@TargetTableName,@PartitionColumn=@PartitionColumn,@RangeUnit=@RangeUnit,
+            @StartValue=@StartValue,@EndValue=@EndValue,@PartitionInterval=@PartitionInterval,
+            @PartitionFunctionName=@PartitionFunctionName,@PartitionSchemeName=@PartitionSchemeName,@FilegroupName=@FilegroupName,
+            @DeploymentPlatform=@DeploymentPlatform,@IndexAlignment=@IndexAlignment,@FuturePartitions=@FuturePartitions,
+            @RetentionPartitions=@RetentionPartitions,@AutoDeleteOldPartitions=@AutoDeleteOldPartitions,@IndexAction=@IndexAction,
+            @StatsAction=@StatsAction,@StatsSamplePercent=@StatsSamplePercent;
+
+        DECLARE constraints_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT kc.name,CASE WHEN kc.type='PK' THEN 'P' ELSE 'U' END
+            FROM sys.key_constraints kc WHERE kc.parent_object_id=@sourceObjectId;
+        OPEN constraints_cursor; FETCH NEXT FROM constraints_cursor INTO @constraintName,@constraintType;
+        WHILE @@FETCH_STATUS=0
+        BEGIN
+            SELECT @keyColumns=STUFF((SELECT N','+QUOTENAME(c.name)+(CASE WHEN ic.is_descending_key=1 THEN N' DESC' ELSE N' ASC' END)
+                FROM sys.index_columns ic JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+                JOIN sys.key_constraints kc2 ON kc2.parent_object_id=ic.object_id AND kc2.unique_index_id=ic.index_id
+                WHERE kc2.name=@constraintName ORDER BY ic.key_ordinal FOR XML PATH(''),TYPE).value('.','nvarchar(max)'),1,1,N'');
+            SET @placement=CASE WHEN @IndexAlignment='ALIGNED' AND EXISTS
+                (SELECT 1 FROM sys.index_columns ic JOIN sys.key_constraints kc ON kc.parent_object_id=ic.object_id AND kc.unique_index_id=ic.index_id
+                 JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+                 WHERE kc.name=@constraintName AND c.name=@PartitionColumn AND ic.key_ordinal>0)
+                THEN N' ON '+QUOTENAME(@PartitionSchemeName)+N'('+QUOTENAME(@PartitionColumn)+N')' ELSE N' ON [PRIMARY]' END;
+            SET @sql=N'ALTER TABLE '+@targetObjectName+N' ADD CONSTRAINT '+QUOTENAME(@constraintName)+N' '+CASE WHEN @constraintType='P' THEN N'PRIMARY KEY ' ELSE N'UNIQUE ' END+N'NONCLUSTERED ('+@keyColumns+N')'+@placement+N';';
+            EXEC sys.sp_executesql @sql;
+            FETCH NEXT FROM constraints_cursor INTO @constraintName,@constraintType;
+        END;
+        CLOSE constraints_cursor; DEALLOCATE constraints_cursor;
+
+        DECLARE indexes_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT i.name,i.index_id,i.is_unique,i.filter_definition,
+                STUFF((SELECT N','+QUOTENAME(c.name)+(CASE WHEN ic2.is_descending_key=1 THEN N' DESC' ELSE N' ASC' END) FROM sys.index_columns ic2 JOIN sys.columns c ON c.object_id=ic2.object_id AND c.column_id=ic2.column_id WHERE ic2.object_id=i.object_id AND ic2.index_id=i.index_id AND ic2.key_ordinal>0 ORDER BY ic2.key_ordinal FOR XML PATH(''),TYPE).value('.','nvarchar(max)'),1,1,N''),
+                STUFF((SELECT N','+QUOTENAME(c.name) FROM sys.index_columns ic2 JOIN sys.columns c ON c.object_id=ic2.object_id AND c.column_id=ic2.column_id WHERE ic2.object_id=i.object_id AND ic2.index_id=i.index_id AND ic2.is_included_column=1 ORDER BY ic2.index_column_id FOR XML PATH(''),TYPE).value('.','nvarchar(max)'),1,1,N'')
+            FROM sys.indexes i WHERE i.object_id=@sourceObjectId AND i.index_id>1 AND i.is_primary_key=0 AND i.is_unique_constraint=0 AND i.type IN (1,2) AND i.is_disabled=0;
+        OPEN indexes_cursor; FETCH NEXT FROM indexes_cursor INTO @indexName,@indexId,@indexUnique,@filter,@keyColumns,@includeColumns;
+        WHILE @@FETCH_STATUS=0
+        BEGIN
+            SET @placement=CASE WHEN @IndexAlignment='ALIGNED' AND (@indexUnique=0 OR EXISTS
+                (SELECT 1 FROM sys.index_columns ic JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+                 WHERE ic.object_id=@sourceObjectId AND ic.index_id=@indexId AND c.name=@PartitionColumn AND ic.key_ordinal>0))
+                THEN N' ON '+QUOTENAME(@PartitionSchemeName)+N'('+QUOTENAME(@PartitionColumn)+N')' ELSE N' ON [PRIMARY]' END;
+            SET @sql=N'CREATE '+CASE WHEN @indexUnique=1 THEN N'UNIQUE ' ELSE N'' END+N'NONCLUSTERED INDEX '+QUOTENAME(@indexName)+N' ON '+@targetObjectName+N'('+@keyColumns+')'+CASE WHEN @includeColumns IS NOT NULL THEN N' INCLUDE ('+@includeColumns+')' ELSE N'' END+CASE WHEN @filter IS NOT NULL THEN N' WHERE '+@filter ELSE N'' END+@placement+N';';
+            EXEC sys.sp_executesql @sql;
+            FETCH NEXT FROM indexes_cursor INTO @indexName,@indexId,@indexUnique,@filter,@keyColumns,@includeColumns;
+        END;
+        CLOSE indexes_cursor; DEALLOCATE indexes_cursor;
+
+        DECLARE defaults_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT dc.name,c.name,dc.definition
+            FROM sys.default_constraints dc JOIN sys.columns c ON c.object_id=dc.parent_object_id AND c.column_id=dc.parent_column_id
+            WHERE dc.parent_object_id=@sourceObjectId;
+        OPEN defaults_cursor; FETCH NEXT FROM defaults_cursor INTO @constraintName,@indexName,@filter;
+        WHILE @@FETCH_STATUS=0
+        BEGIN
+            SET @sql=N'ALTER TABLE '+@targetObjectName+N' ADD CONSTRAINT '+QUOTENAME(@constraintName)+N' DEFAULT '+@filter+N' FOR '+QUOTENAME(@indexName)+N';';
+            EXEC sys.sp_executesql @sql;
+            FETCH NEXT FROM defaults_cursor INTO @constraintName,@indexName,@filter;
+        END;
+        CLOSE defaults_cursor; DEALLOCATE defaults_cursor;
+
+        DECLARE checks_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT cc.name,cc.definition FROM sys.check_constraints cc WHERE cc.parent_object_id=@sourceObjectId;
+        OPEN checks_cursor; FETCH NEXT FROM checks_cursor INTO @constraintName,@filter;
+        WHILE @@FETCH_STATUS=0
+        BEGIN
+            SET @sql=N'ALTER TABLE '+@targetObjectName+N' ADD CONSTRAINT '+QUOTENAME(@constraintName)+N' CHECK '+@filter+N';';
+            EXEC sys.sp_executesql @sql;
+            FETCH NEXT FROM checks_cursor INTO @constraintName,@filter;
+        END;
+        CLOSE checks_cursor; DEALLOCATE checks_cursor;
+
+        EXEC dbo.usp_DBA_BatchLoadPartitionedTable
+            @SourceSchemaName=@SourceSchemaName,@SourceTableName=@SourceTableName,@TargetSchemaName=@TargetSchemaName,
+            @TargetTableName=@TargetTableName,@BatchColumn=@BatchColumn,@BatchSize=@BatchSize,@StartValue=@LoadStartValue,
+            @EndValue=@LoadEndValue,@KeepIdentity=@KeepIdentity,@MaxBatches=@MaxBatches;
+        SELECT @newConfigId=ConfigId FROM dbo.DBA_PartitionMaintenanceConfig WHERE SchemaName=@TargetSchemaName AND TableName=@TargetTableName;
+        IF @StatsAction<>'NONE' EXEC dbo.usp_DBA_UpdateTableStatistics @ConfigId=@newConfigId;
+        INSERT dbo.DBA_PartitionMaintenanceHistory(RunId,Action,SchemaName,TableName,CommandText,Succeeded)
+            VALUES(@runId,'CREATE_AND_INITIAL_LOAD',@TargetSchemaName,@TargetTableName,@sql,1);
+    END TRY
+    BEGIN CATCH
+        IF CURSOR_STATUS('local','defaults_cursor')>=0 CLOSE defaults_cursor;
+        IF CURSOR_STATUS('local','defaults_cursor')>-3 DEALLOCATE defaults_cursor;
+        IF CURSOR_STATUS('local','checks_cursor')>=0 CLOSE checks_cursor;
+        IF CURSOR_STATUS('local','checks_cursor')>-3 DEALLOCATE checks_cursor;
+        IF CURSOR_STATUS('local','constraints_cursor')>=0 CLOSE constraints_cursor;
+        IF CURSOR_STATUS('local','constraints_cursor')>-3 DEALLOCATE constraints_cursor;
+        IF CURSOR_STATUS('local','indexes_cursor')>=0 CLOSE indexes_cursor;
+        IF CURSOR_STATUS('local','indexes_cursor')>-3 DEALLOCATE indexes_cursor;
+        INSERT dbo.DBA_PartitionMaintenanceHistory(RunId,Action,SchemaName,TableName,CommandText,Succeeded,ErrorNumber,ErrorMessage)
+            VALUES(@runId,'CREATE_AND_INITIAL_LOAD_ERROR',@TargetSchemaName,@TargetTableName,@sql,0,ERROR_NUMBER(),ERROR_MESSAGE());
+        THROW;
+    END CATCH;
+END;
+GO
+
 CREATE OR ALTER PROCEDURE dbo.usp_DBA_RemoveOldPartitions
     @ConfigId int = NULL
 AS

@@ -24,6 +24,7 @@ Use this table as the first lookup when configuring the procedures. Detailed pro
 | `@SchemaName` | Required | Existing schema name | `'dbo'` | Convert, Register |
 | `@TableName` | Required | Existing table name | `'SalesHistory'` | Convert, Register |
 | `@PartitionColumn` | Required | Date/time or integer column | `'SaleDate'` | Convert, Register |
+| `@BatchColumn` | Required for initial load | Monotonic/ordered ID or date column present in source and target | `'SaleDate'` or `'OrderId'` | Initial load |
 | `@RangeUnit` | Required / `DAY` for Register | `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`, `INTEGER` | `'MONTH'` | Convert, Register |
 | `@StartValue` | Required | First date/time or integer boundary | `'2024-01-01'` | Convert |
 | `@EndValue` | Required | Last date/time or integer boundary | `'2027-12-01'` | Convert |
@@ -45,6 +46,12 @@ Use this table as the first lookup when configuring the procedures. Detailed pro
 | `@StatsSamplePercent` | `NULL` | `1` to `100` when using `SAMPLE` | `25` | Convert, Register, Statistics |
 | `@ConfigId` | `NULL` | `NULL` for all enabled rows or an existing ID | `1` | Maintenance procedures |
 | `@FuturePartitionsOverride` | `NULL` | Positive temporary override | `12` | Add boundaries |
+| `@BatchSize` | `100000` | Positive number of source rows requested per batch | `50000` | Initial load |
+| `@StartValue` | `NULL` | Optional inclusive ID/date lower bound; exclusive when resuming | `'2024-01-01'` | Initial load |
+| `@EndValue` | `NULL` | Optional inclusive ID/date upper bound | `'2024-12-31'` | Initial load |
+| `@ResumeFromValue` | `0` | `0` for empty target; `1` for exclusive resume | `1` | Initial load |
+| `@KeepIdentity` | `1` | `0` or `1` | `1` | Initial load |
+| `@MaxBatches` | `0` | `0` for all remaining rows, or a positive limit | `10` | Initial load |
 | `@Enabled` | `1` | `0` or `1` | `1` | Register |
 
 ## Files and Procedures
@@ -57,6 +64,8 @@ Use this table as the first lookup when configuring the procedures. Detailed pro
 | Procedure | Use it for |
 |---|---|
 | `dbo.usp_DBA_ConvertTableToPartitioned` | One-time conversion of an existing eligible table |
+| `dbo.usp_DBA_BatchLoadPartitionedTable` | Batch-loading an existing non-partitioned table into an empty partitioned target |
+| `dbo.usp_DBA_CreateAndLoadPartitionedTable` | Creating a target from source metadata, partitioning it, copying keys/indexes, and batch-loading data |
 | `dbo.usp_DBA_RegisterPartitionedTable` | Configuring a table that is already partitioned |
 | `dbo.usp_DBA_AddPartitionBoundaries` | Adding future partitions only |
 | `dbo.usp_DBA_RemoveOldPartitions` | Removing old partitions only |
@@ -72,6 +81,8 @@ Use this table as the first lookup when configuring the procedures. Detailed pro
 4. Confirm the partition column is a supported `date`, `datetime`, `datetime2`, `smalldatetime`, `tinyint`, `smallint`, `int`, or `bigint` column.
 5. If using `SWITCH`, create an empty target table with matching columns, indexes, constraints, compression, and partitioning requirements.
 6. Make sure the partition column is in every unique index key that must become aligned.
+
+For an initial load, use `dbo.usp_DBA_CreateAndLoadPartitionedTable` when you want the package to create the target automatically. It derives partition function and scheme names from the target table and partition column when names are not supplied. The source table remains unchanged, so the final cutover can be performed during a planned maintenance window.
 
 ## 1. Install the Package
 
@@ -174,7 +185,171 @@ EXEC dbo.usp_DBA_ConvertTableToPartitioned
 
 `ALIGNED` rebuilds eligible rowstore nonclustered indexes onto the partition scheme. `NONALIGNED` leaves nonclustered indexes in their current data space. Unique indexes must contain the partition column to be aligned.
 
-## 4. Register an Already Partitioned Table
+## 4. Initial Load in Batches
+
+Use `dbo.usp_DBA_BatchLoadPartitionedTable` after the target table has been created and partitioned. The procedure copies rows in ordered batches based on an ID or date column. Each batch is committed and logged separately, so a failed run can be resumed by calling it again with the last completed boundary supplied as `@StartValue`.
+
+### Initial-load sequence
+
+1. Keep the original non-partitioned table unchanged.
+2. Create an empty target table with the same columns, data types, identity properties, constraints, and indexes.
+3. Give the empty target a clustered index. It may initially be on `PRIMARY`.
+4. Convert the empty target with `usp_DBA_ConvertTableToPartitioned`; this creates its partition function and scheme.
+5. Run the batch loader with an ID or date `@BatchColumn`.
+6. Review `INITIAL_LOAD_BATCH`, `INITIAL_LOAD_COMPLETE`, and `INITIAL_LOAD_ERROR` history rows.
+7. Stop writes or use a CDC/change-tracking catch-up process, validate row counts, then perform the final rename/synonym/application cutover separately.
+
+The target must be empty for a new load and must already have a clustered index on a partition scheme. Set `@ResumeFromValue = 1` only when continuing a partially loaded target. In resume mode, `@StartValue` is exclusive, so rows at the last successful boundary are not copied twice. `@BatchColumn` must be present with a compatible type in both tables. Duplicate date values are supported: a batch may contain more than `@BatchSize` rows so all rows sharing the boundary value are copied together. For best restart behavior, use a non-null, increasing ID when one is available.
+
+### Automatic create, metadata copy, and load
+
+This procedure creates the target from source column metadata, creates partition objects using the target table name, recreates primary keys, unique constraints, defaults, checks, and rowstore indexes, then loads the data in batches:
+
+```sql
+EXEC dbo.usp_DBA_CreateAndLoadPartitionedTable
+    @SourceSchemaName = 'dbo',
+    @SourceTableName = 'SalesHistory',
+    @TargetSchemaName = 'dbo',
+    @TargetTableName = 'SalesHistory_Partitioned',
+    @PartitionColumn = 'SaleDate',
+    @RangeUnit = 'MONTH',
+    @StartValue = '2024-01-01',
+    @EndValue = '2027-12-01',
+    @PartitionInterval = 1,
+    @DeploymentPlatform = 'AZURE_SQLDB',
+    @IndexAlignment = 'ALIGNED',
+    @BatchColumn = 'SaleDate',
+    @BatchSize = 50000,
+    @LoadStartValue = '2024-01-01',
+    @LoadEndValue = '2027-12-01',
+    @KeepIdentity = 1,
+    @StatsAction = 'FULLSCAN';
+```
+
+If partition object names are omitted, the procedure generates `PF_DBA_<TargetTable>_<PartitionColumn>` and `PS_DBA_<TargetTable>_<PartitionColumn>`. The target must not already exist.
+
+The automatic copy supports ordinary rowstore indexes, primary keys, unique constraints, default constraints, check constraints, identity columns, included columns, and filtered indexes. Foreign keys, computed columns, XML/spatial/columnstore/hash indexes, triggers, permissions, and extended properties require explicit deployment review and are not silently copied.
+
+| Parameter | Default | Expected value | Example |
+|---|---|---|---|
+| `@SourceSchemaName`, `@SourceTableName` | Required | Existing source table | `'dbo'`, `'SalesHistory'` |
+| `@TargetSchemaName`, `@TargetTableName` | Required | New target table name; target must not exist | `'dbo'`, `'SalesHistory_Partitioned'` |
+| `@PartitionColumn` | Required | Source date/time or integer column | `'SaleDate'` |
+| `@RangeUnit` | Required | `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`, `INTEGER` | `'MONTH'` |
+| `@StartValue`, `@EndValue` | Required | Partition boundary values | `'2024-01-01'`, `'2027-12-01'` |
+| `@PartitionFunctionName`, `@PartitionSchemeName` | Generated | Optional unique object names | `'PF_SalesHistory_Partitioned'` |
+| `@DeploymentPlatform` | `AUTO` | `AUTO`, `ONPREM`, `AWS_RDS`, `AZURE_SQLDB`, `AZURE_MI` | `'AZURE_SQLDB'` |
+| `@IndexAlignment` | `ALIGNED` | `ALIGNED` or `NONALIGNED` | `'ALIGNED'` |
+| `@BatchColumn` | `@PartitionColumn` | Ordered ID/date column in source and target | `'SaleDate'` |
+| `@BatchSize` | `100000` | Positive row target per batch | `50000` |
+| `@LoadStartValue`, `@LoadEndValue` | `NULL` | Optional inclusive load bounds | `'2024-01-01'`, `'2027-12-01'` |
+| `@KeepIdentity` | `1` | `0` or `1` | `1` |
+| `@MaxBatches` | `0` | `0` for all rows or positive test limit | `5` |
+
+### Prepare the empty target
+
+Create the target using your normal schema deployment process so identity properties, defaults, constraints, compression, and indexes are preserved. The following is a minimal shape example; replace the columns and clustered key with the real source-table definition:
+
+```sql
+CREATE TABLE dbo.SalesHistory_Partitioned
+(
+    SalesHistoryId bigint NOT NULL,
+    SaleDate date NOT NULL,
+    CustomerId int NOT NULL,
+    Amount decimal(19,4) NOT NULL
+);
+
+CREATE UNIQUE CLUSTERED INDEX CX_SalesHistory_Partitioned
+    ON dbo.SalesHistory_Partitioned (SalesHistoryId, SaleDate);
+
+-- Partition the empty target before loading it.
+EXEC dbo.usp_DBA_ConvertTableToPartitioned
+    @SchemaName = 'dbo',
+    @TableName = 'SalesHistory_Partitioned',
+    @PartitionColumn = 'SaleDate',
+    @RangeUnit = 'MONTH',
+    @StartValue = '2024-01-01',
+    @EndValue = '2027-12-01',
+    @PartitionFunctionName = 'PF_SalesHistory_Load',
+    @PartitionSchemeName = 'PS_SalesHistory_Load',
+    @IndexAlignment = 'ALIGNED';
+```
+
+The target conversion must complete successfully before `usp_DBA_BatchLoadPartitionedTable` is called. The source and target need not have the same table name, but their insertable column names and data types must match.
+
+### Date-based batch load
+
+```sql
+EXEC dbo.usp_DBA_BatchLoadPartitionedTable
+    @SourceSchemaName = 'dbo',
+    @SourceTableName = 'SalesHistory',
+    @TargetSchemaName = 'dbo',
+    @TargetTableName = 'SalesHistory_Partitioned',
+    @BatchColumn = 'SaleDate',
+    @BatchSize = 50000,
+    @StartValue = '2024-01-01',
+    @EndValue = '2027-12-01',
+    @KeepIdentity = 1;
+```
+
+### ID-based batch load
+
+```sql
+EXEC dbo.usp_DBA_BatchLoadPartitionedTable
+    @SourceSchemaName = 'dbo',
+    @SourceTableName = 'OrderEvents',
+    @TargetSchemaName = 'dbo',
+    @TargetTableName = 'OrderEvents_Partitioned',
+    @BatchColumn = 'OrderId',
+    @BatchSize = 100000,
+    @StartValue = '1',
+    @EndValue = '10000000',
+    @KeepIdentity = 1;
+```
+
+### Controlled test and resume
+
+Run only five batches first, inspect the target, then continue from the last logged boundary:
+
+```sql
+-- Test only five batches.
+EXEC dbo.usp_DBA_BatchLoadPartitionedTable
+    @SourceSchemaName = 'dbo', @SourceTableName = 'SalesHistory',
+    @TargetSchemaName = 'dbo', @TargetTableName = 'SalesHistory_Partitioned',
+    @BatchColumn = 'SaleDate', @BatchSize = 50000,
+    @StartValue = '2024-01-01', @EndValue = '2027-12-01',
+    @MaxBatches = 5;
+
+-- Resume after checking the last successful boundary.
+SELECT TOP (1) BoundaryValue
+FROM dbo.DBA_PartitionMaintenanceHistory
+WHERE Action = 'INITIAL_LOAD_BATCH'
+  AND TableName = 'SalesHistory_Partitioned'
+  AND Succeeded = 1
+ORDER BY EventTime DESC;
+
+-- Pass the returned boundary as an exclusive resume value.
+EXEC dbo.usp_DBA_BatchLoadPartitionedTable
+    @SourceSchemaName = 'dbo', @SourceTableName = 'SalesHistory',
+    @TargetSchemaName = 'dbo', @TargetTableName = 'SalesHistory_Partitioned',
+    @BatchColumn = 'SaleDate', @BatchSize = 50000,
+    @StartValue = '2025-06-01', @EndValue = '2027-12-01',
+    @ResumeFromValue = 1;
+```
+
+| Parameter | Default | Expected value | Example |
+|---|---|---|---|
+| `@SourceSchemaName`, `@SourceTableName` | Required | Existing non-partitioned source table | `'dbo'`, `'SalesHistory'` |
+| `@TargetSchemaName`, `@TargetTableName` | Required | Empty partitioned target table | `'dbo'`, `'SalesHistory_Partitioned'` |
+| `@BatchColumn` | Required | Non-null ordered ID/date column in both tables | `'OrderId'` or `'SaleDate'` |
+| `@BatchSize` | `100000` | Positive batch row target | `50000` |
+| `@StartValue` | `NULL` | Inclusive lower ID/date bound | `'2024-01-01'` |
+| `@EndValue` | `NULL` | Inclusive upper ID/date bound | `'2027-12-01'` |
+| `@ResumeFromValue` | `0` | `0` for empty target; `1` for exclusive resume | `1` |
+| `@KeepIdentity` | `1` | `0` or `1` | `1` |
+| `@MaxBatches` | `0` | `0` for all rows, or positive test limit | `5` |
+
+## 5. Register an Already Partitioned Table
 
 Use registration when the table already has a partition function, partition scheme, and aligned clustered index:
 
@@ -210,7 +385,7 @@ EXEC dbo.usp_DBA_RegisterPartitionedTable
 | `@StatsSamplePercent` | `NULL` | `1` to `100` with `SAMPLE` | `20` |
 | `@Enabled` | `1` | `0` or `1` | `1` |
 
-## 5. Run the Full Maintenance Workflow
+## 6. Run the Full Maintenance Workflow
 
 Create a weekly job step with:
 
@@ -232,7 +407,7 @@ For one table only:
 EXEC dbo.usp_DBA_MaintainTablePartitions @ConfigId = 1;
 ```
 
-## 6. Run Only One Maintenance Task
+## 7. Run Only One Maintenance Task
 
 These procedures do not create, split, merge, switch, or delete partitions unless explicitly stated:
 

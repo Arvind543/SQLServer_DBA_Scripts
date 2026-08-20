@@ -6,6 +6,8 @@ GRANT SELECT, INSERT, UPDATE ON dbo.DBA_PartitionMaintenanceConfig TO PartitionM
 GRANT SELECT, INSERT ON dbo.DBA_PartitionMaintenanceHistory TO PartitionMaintenanceOperator;
 GRANT EXECUTE ON dbo.usp_DBA_RegisterPartitionedTable TO PartitionMaintenanceOperator;
 GRANT EXECUTE ON dbo.usp_DBA_ConvertTableToPartitioned TO PartitionMaintenanceOperator;
+GRANT EXECUTE ON dbo.usp_DBA_BatchLoadPartitionedTable TO PartitionMaintenanceOperator;
+GRANT EXECUTE ON dbo.usp_DBA_CreateAndLoadPartitionedTable TO PartitionMaintenanceOperator;
 GRANT EXECUTE ON dbo.usp_DBA_AddPartitionBoundaries TO PartitionMaintenanceOperator;
 GRANT EXECUTE ON dbo.usp_DBA_RemoveOldPartitions TO PartitionMaintenanceOperator;
 GRANT EXECUTE ON dbo.usp_DBA_UpdateTableStatistics TO PartitionMaintenanceOperator;
