@@ -13,6 +13,7 @@ The scripts are organized by purpose to make them easier to find and run:
 - [storage/](storage)
 - [security/](security)
 - [maintenance/](maintenance)
+  - [maintenance/AutoTablePartitioning/](maintenance/AutoTablePartitioning)
 - [utilities/](utilities)
 
 ## Categories & Scripts
@@ -95,6 +96,10 @@ The scripts are organized by purpose to make them easier to find and run:
 
 - [maintenance/DBErrorLogging.sql](maintenance/DBErrorLogging.sql)
   - Purpose: Logging infrastructure for DB error capture; inspect carefully before deployment.
+- [maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning.sql](maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning.sql)
+  - Purpose: Registers existing partitioned tables and automatically adds future boundaries, removes old partitions, maintains indexes, and records history.
+- [maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning_Grants.sql](maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning_Grants.sql)
+  - Purpose: Creates the operator role and documents the object permissions required by the partition maintenance procedures.
 
 ### Utilities / Helpers
 - [utilities/Exp_DBUsersFor_Refresh.py](utilities/Exp_DBUsersFor_Refresh.py)
@@ -122,6 +127,21 @@ The scripts are organized by purpose to make them easier to find and run:
   ```bash
   python3 utilities/Exp_DBUsersFor_Refresh.py --help
   ```
+
+### Automated Table Partitioning
+1. Deploy [maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning.sql](maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning.sql) in the application database.
+2. Deploy [maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning_Grants.sql](maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning_Grants.sql), then grant `ALTER` on each managed table and its empty switch target to `PartitionMaintenanceOperator`.
+3. Register each already-partitioned table. `RANGE RIGHT` partition functions must have at least one seeded boundary:
+   ```sql
+   EXEC dbo.usp_DBA_RegisterPartitionedTable
+       @SchemaName = 'dbo', @TableName = 'SalesHistory', @PartitionColumn = 'SaleDate',
+       @TargetTableName = 'SalesHistory_Archive', @RangeUnit = 'MONTH',
+       @FuturePartitions = 6, @RetentionPartitions = 24,
+       @AutoDeleteOldPartitions = 1, @IndexAction = 'AUTO';
+   ```
+4. Create a weekly SQL Agent T-SQL step: `EXEC dbo.usp_DBA_MaintainTablePartitions;`.
+
+The utility adds future boundaries, switches or truncates old partition 1 before merging its boundary, rebuilds/reorganizes indexes according to configured thresholds, and records successful and failed actions in `dbo.DBA_PartitionMaintenanceHistory`. `TargetTableName` must be empty and schema/index aligned; use no target when permanent deletion is intended.
 
 ## Permissions & Requirements
 - Many scripts require VIEW SERVER STATE and/or access to msdb; some require sysadmin rights.
