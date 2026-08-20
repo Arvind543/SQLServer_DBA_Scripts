@@ -122,5 +122,5 @@ A curated set of T-SQL (and a small Python helper) utilities for SQL Server DBAs
 - Or I can open a PR with the README update so you can review before merging.
 
 ## Author / Contact
-- Author: @ArvindToopru (repository owner: @Arvind543)
+- Author: @ArvindToorpu (repository owner: @Arvind543)
 - Disclaimer: Use at your own risk — test in dev/staging first.
