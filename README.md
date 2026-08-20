@@ -2,125 +2,137 @@
 
 A curated set of T-SQL (and a small Python helper) utilities for SQL Server DBAs to audit, monitor, and maintain SQL Server instances and databases. These scripts are designed to be run in SSMS or via sqlcmd — always review and test in non-production environments first.
 
+## Repository layout
+
+The scripts are organized by purpose to make them easier to find and run:
+
+- [auditing/](auditing)
+- [monitoring/](monitoring)
+  - [monitoring/Kill_Idle_Sessions_Proc/](monitoring/Kill_Idle_Sessions_Proc)
+- [performance/](performance)
+- [storage/](storage)
+- [security/](security)
+- [maintenance/](maintenance)
+- [utilities/](utilities)
+
 ## Categories & Scripts
 
 ### Auditing / Object Changes
-- Audit_DDL_Changes.sql
+- [auditing/Audit_DDL_Changes.sql](auditing/Audit_DDL_Changes.sql)
   - Purpose: Finds CREATE and MODIFY timestamps from sys.objects and DROP events from the SQL Server Default Trace.
-  - Example:
-    ```sql
-    -- Edit the hours window near the top of the file:
-    DECLARE @HoursToGoBack INT = 168; -- last 7 days
-    -- Run the script in the database you want to audit
-    ```
-  - Output: EventTime, EventType (CREATE/MODIFY/DROP), ObjectType, SchemaName, ObjectName, LoginName
+  - Output: EventTime, EventType (CREATE/MODIFY/DROP), ObjectType, SchemaName, ObjectName, LoginName.
 
-- DBA_RecentObjectChanges.sql
-  - Purpose: Alternate report for recent object changes; inspect for differences in logic before use.
+- [auditing/DBA_RecentObjectChanges.sql](auditing/DBA_RecentObjectChanges.sql)
+  - Purpose: Alternate report for recent object changes; inspect before using in production.
 
 ### Monitoring / Current Activity
-- DBA_04_BlockingAndLongQueries.sql
-  - Purpose: Shows active sessions, blocking IDs, waits, duration, current statement and plan.
-  - Example (sqlcmd):
-    ```bash
-    sqlcmd -S myserver -d master -E -i "DBA_04_BlockingAndLongQueries.sql"
-    ```
+- [monitoring/DBA_04_BlockingAndLongQueries.sql](monitoring/DBA_04_BlockingAndLongQueries.sql)
+  - Purpose: Shows active sessions, blocking IDs, wait types, duration, current statement, and execution plan context.
 
-- DBA_06_AgentJobStatus.sql
-  - Purpose: Lists SQL Agent jobs, last outcome and scheduled times.
-  - Note: Queries `msdb` — run where msdb is accessible.
+- [monitoring/DBA_06_AgentJobStatus.sql](monitoring/DBA_06_AgentJobStatus.sql)
+  - Purpose: Lists SQL Agent jobs, last outcome, and scheduled times.
+
+- [monitoring/Kill_Idle_Sessions_Proc/Proc_Kill_Idle_Sessions.sql](monitoring/Kill_Idle_Sessions_Proc/Proc_Kill_Idle_Sessions.sql)
+  - Purpose: Stored procedure to identify and terminate idle sessions that have been inactive too long.
 
 ### Performance / Indexing / Query Tuning
-- Get_Missing_Index_Recommendations.sql
-  - Purpose: Missing index DMVs to identify index opportunities. Review suggestions and test.
-- DBA_08_UnusedIndexes.sql
-  - Purpose: Finds nonclustered indexes with write activity but zero reads.
-  - Output: Includes a `DROP INDEX [...]` suggestion — DO NOT run without review.
+- [performance/Get_Missing_Index_Recommendations.sql](performance/Get_Missing_Index_Recommendations.sql)
+  - Purpose: Uses missing index DMVs to highlight index opportunities.
 
-- DBA_15_MostExpensiveQueries.sql
-  - Purpose: Rank queries by cost (elapsed time / CPU / reads). Use to target tuning.
+- [performance/DBA_08_UnusedIndexes.sql](performance/DBA_08_UnusedIndexes.sql)
+  - Purpose: Finds nonclustered indexes with write activity but no reads.
 
-- SqlSrv_DBA_IndexFragmentation.sql
-  - Purpose: Show fragmentation levels and suggested rebuild/reorganize actions.
+- [performance/DBA_12_WaitStatsAnalysis.sql](performance/DBA_12_WaitStatsAnalysis.sql)
+  - Purpose: Summarizes waits from sys.dm_os_wait_stats to highlight bottlenecks.
+
+- [performance/DBA_15_MostExpensiveQueries.sql](performance/DBA_15_MostExpensiveQueries.sql)
+  - Purpose: Ranks queries by cost (elapsed time, CPU, reads).
+
+- [performance/SqlSrv_DBA_DatabaseOverview.sql](performance/SqlSrv_DBA_DatabaseOverview.sql)
+  - Purpose: Provides a quick database health and sizing overview.
+
+- [performance/SqlSrv_DBA_IndexFragmentation.sql](performance/SqlSrv_DBA_IndexFragmentation.sql)
+  - Purpose: Shows fragmentation levels and suggested rebuild/reorganize actions.
+
+- [performance/List_Frag_Idx.sql](performance/List_Frag_Idx.sql)
+  - Purpose: Lists fragmented indexes and their estimated maintenance impact.
 
 ### Storage / I/O / Disk
-- DBA_07_FileIOStats.sql
-  - Purpose: Per-file I/O stats via sys.dm_io_virtual_file_stats; shows ave read/write stall times.
-- DBA_11_HighVLFCount.sql
-  - Purpose: Detect databases with large numbers of VLFs (log fragmentation).
-- DBA_14_ServerDiskSpace.sql
-  - Purpose: Checks server volume/disk free space.
+- [storage/DBA_07_FileIOStats.sql](storage/DBA_07_FileIOStats.sql)
+  - Purpose: Captures per-file I/O stats and average read/write stall times.
 
-### Waits / Resource Analysis
-- DBA_12_WaitStatsAnalysis.sql
-  - Purpose: Summarizes waits (sys.dm_os_wait_stats) to highlight resource bottlenecks.
+- [storage/DBA_11_HighVLFCount.sql](storage/DBA_11_HighVLFCount.sql)
+  - Purpose: Detects databases with unusually high VLF counts.
+
+- [storage/DBA_14_ServerDiskSpace.sql](storage/DBA_14_ServerDiskSpace.sql)
+  - Purpose: Checks free space across SQL Server volumes.
 
 ### Security / Permissions / Server Health
-- DBA_09_ServerSecurityAudit.sql
-  - Purpose: Lists server principals (logins) and their server roles.
-- DBA_13_UserPermissionsAudit.sql
+- [security/DBA_09_ServerSecurityAudit.sql](security/DBA_09_ServerSecurityAudit.sql)
+  - Purpose: Lists server principals and server roles.
+
+- [security/DBA_13_UserPermissionsAudit.sql](security/DBA_13_UserPermissionsAudit.sql)
   - Purpose: Audits database-level permissions and user mappings.
 
 ### Maintenance / Utilities
-- DBA_10_DropAllObjects.sql and SqlSrv_Drop_AllDb_Objs.sql
-  - Purpose: Generate DROP statements for user objects (foreign keys, views, procs, functions, tables, types).
-  - WARNING: These scripts print DROP statements; they do NOT execute them automatically. Copy the printed statements to a new window, review, then execute only when safe.
+- [maintenance/DBA_10_DropAllObjects.sql](maintenance/DBA_10_DropAllObjects.sql)
+  - Purpose: Generates DROP statements for user objects.
 
-- DBA_16_DatabaseConfigCheck.sql
-  - Purpose: Check key DB configuration settings (recovery model, auto-shrink, compatibility level, etc.)
+- [maintenance/SqlSrv_Drop_AllDb_Objs.sql](maintenance/SqlSrv_Drop_AllDb_Objs.sql)
+  - Purpose: Alternate object-drop generator focused on full database cleanup.
 
-- DBA_17_LargestTables.sql
-  - Purpose: List tables ordered by space used (useful for cleanup / archiving decisions).
+- [maintenance/DBA_16_DatabaseConfigCheck.sql](maintenance/DBA_16_DatabaseConfigCheck.sql)
+  - Purpose: Checks recovery model, auto-shrink, compatibility level, and other key settings.
 
-- DBA_19_BackupHistory.sql
-  - Purpose: Query msdb backup history to verify last backups per database.
+- [maintenance/DBA_17_LargestTables.sql](maintenance/DBA_17_LargestTables.sql)
+  - Purpose: Lists largest tables by space used.
 
-- DBA_20_GenerateSpHelp.sql
-  - Purpose: Generate documentation/help for stored procedures (inspect the file for exact behavior).
+- [maintenance/DBA_19_BackupHistory.sql](maintenance/DBA_19_BackupHistory.sql)
+  - Purpose: Queries msdb backup history to verify the last successful backups.
 
-- DBErrorLogging.sql
-  - Purpose: Logging infrastructure for DB error capture — large script; inspect before deploying.
+- [maintenance/DBA_20_GenerateSpHelp.sql](maintenance/DBA_20_GenerateSpHelp.sql)
+  - Purpose: Generates documentation for stored procedures.
 
-- Exp_DBUsersFor_Refresh.py
-  - Purpose: Python helper to export DB user creation statements for refresh/migration workflows.
-  - Example:
-    ```bash
-    python3 Exp_DBUsersFor_Refresh.py --help
-    ```
-    (Inspect header/comments for exact CLI arguments.)
+- [maintenance/DBErrorLogging.sql](maintenance/DBErrorLogging.sql)
+  - Purpose: Logging infrastructure for DB error capture; inspect carefully before deployment.
+
+### Utilities / Helpers
+- [utilities/Exp_DBUsersFor_Refresh.py](utilities/Exp_DBUsersFor_Refresh.py)
+  - Purpose: Exports database user creation statements for refresh or migration workflows.
 
 ## How to run (quick)
+
 - Using SSMS:
   1. Open the .sql file in SSMS.
   2. Set the correct database in the context selector.
-  3. Edit any variables near the top of the file (where present).
+  3. Edit any variables near the top of the file, if present.
   4. Execute.
 
-- Using sqlcmd (Windows auth example):
+- Using sqlcmd:
   ```bash
-  sqlcmd -S myserver\instance -d MyDatabase -E -i "Get_Missing_Index_Recommendations.sql"
+  sqlcmd -S myserver\instance -d MyDatabase -E -i "performance/Get_Missing_Index_Recommendations.sql"
   ```
 
 - Capture output to file:
   ```bash
-  sqlcmd -S myserver -d MyDatabase -E -i "DBA_10_DropAllObjects.sql" -o "drop_statements.txt"
+  sqlcmd -S myserver -d MyDatabase -E -i "maintenance/DBA_10_DropAllObjects.sql" -o "drop_statements.txt"
+  ```
+
+- Python helper:
+  ```bash
+  python3 utilities/Exp_DBUsersFor_Refresh.py --help
   ```
 
 ## Permissions & Requirements
-- Many scripts require VIEW SERVER STATE and/or access to msdb. Some require sysadmin.
-- Default Trace must be enabled for DROP event auditing (Audit_DDL_Changes.sql).
+- Many scripts require VIEW SERVER STATE and/or access to msdb; some require sysadmin rights.
+- Default Trace must be enabled for drop-event auditing in [auditing/Audit_DDL_Changes.sql](auditing/Audit_DDL_Changes.sql).
 - Always test in non-production and back up before performing structural changes.
 
 ## Safety & Best Practices
-- Scripts that produce DROP statements should be treated as generators — do not execute automatically.
-- Review queries that reference instance-level DMVs before running in multi-tenant / restricted environments.
-- Use a dedicated read-only account where appropriate or run interactively in SSMS so you can inspect results before acting.
-
-## Suggested next steps (if you want me to apply changes)
-- I can create a README commit with this content and a commit message like:
-  `docs: expand README with script categories, descriptions and run examples`
-- Or I can open a PR with the README update so you can review before merging.
+- Treat scripts that generate DROP statements as generators, not as auto-executing cleanup commands.
+- Review instance-level DMV queries before running in multi-tenant or tightly restricted environments.
+- Use a dedicated read-only account when possible and inspect results before acting.
 
 ## Author / Contact
 - Author: @ArvindToorpu (repository owner: @Arvind543)
-- Disclaimer: Use at your own risk — test in dev/staging first.
+- Disclaimer: Use at your own risk; test in dev/staging first.
