@@ -14,6 +14,7 @@ The scripts are organized by purpose to make them easier to find and run:
 - [security/](security)
 - [maintenance/](maintenance)
   - [maintenance/AutoTablePartitioning/](maintenance/AutoTablePartitioning)
+    - [maintenance/LinkedServerRecovery/](maintenance/LinkedServerRecovery)
 - [utilities/](utilities)
 
 ## Categories & Scripts
@@ -100,6 +101,8 @@ The scripts are organized by purpose to make them easier to find and run:
   - Purpose: Registers existing partitioned tables and automatically adds future boundaries, removes old partitions, maintains indexes, and records history.
 - [maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning_Grants.sql](maintenance/AutoTablePartitioning/DBA_AutoTablePartitioning_Grants.sql)
   - Purpose: Creates the operator role and documents the object permissions required by the partition maintenance procedures.
+- [maintenance/LinkedServerRecovery/DBA_LinkedServerRecovery.sql](maintenance/LinkedServerRecovery/DBA_LinkedServerRecovery.sql)
+  - Purpose: Captures linked-server definitions, security mappings, and mapped-login database permissions, then generates reviewable recovery statements.
 
 ### Utilities / Helpers
 - [utilities/Exp_DBUsersFor_Refresh.py](utilities/Exp_DBUsersFor_Refresh.py)
